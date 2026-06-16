@@ -164,7 +164,6 @@ AgenticRAG/
 │           └── graph.json            # 图谱数据
 ├── .env.example                      # 环境变量模板
 ├── .gitignore                        # Git 忽略规则
-├── requirements.txt                  # Python 依赖清单
 └── README.md
 ```
 
@@ -245,8 +244,7 @@ AgenticRAG/
 | `NEO4J_URI`         | `bolt://localhost:7687`     | Neo4j 连接地址        |
 | `NEO4J_USER`        | `neo4j`                     | Neo4j 用户名         |
 | `NEO4J_PASSWORD`    | `password`                  | Neo4j 密码          |
-| `BGE_MODEL_PATH`    | `BAAI/bge-m3`               | 嵌入模型路径            |
-| `BGE_RERANKER_PATH` | `BAAI/bge-reranker-v2-m3`   | 重排模型路径            |
+
 | `HOST`              | `0.0.0.0`                   | 服务监听地址            |
 | `PORT`              | `8000`                      | 服务端口              |
 

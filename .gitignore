@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.venv/
+.uv-cache/
+.npm-cache/
 dist/
 build/
 
@@ -11,6 +14,12 @@ build/
 # 数据
 data/chroma/
 data/knowledge_bases/
+data/sessions.sqlite3*
+data/local-run/
+
+# 本地模型和源码归档
+models/
+*.rar
 
 
 # 前端

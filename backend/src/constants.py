@@ -3,6 +3,6 @@ SUPPORTED_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".pptx", ".txt", ".md",
     ".csv", ".xlsx", ".xls", ".html", ".htm", ".xml", ".json", ".rtf",
     ".eml", ".msg", ".epub",
-    ".png", ".jpg", ".jpeg", ".tiff", ".bmp",
+    ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp",
     ".odt", ".odp", ".ods",
 }

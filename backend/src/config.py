@@ -8,6 +8,7 @@ class Settings(BaseSettings):
 
     bge_model_path: str = "BAAI/bge-m3"
     bge_reranker_path: str = "BAAI/bge-reranker-v2-m3"
+    hf_hub_offline: bool = False
     chroma_collection: str = "agentic_rag"
 
     neo4j_uri: str = "bolt://localhost:7687"

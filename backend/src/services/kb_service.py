@@ -2,9 +2,13 @@ import json, shutil, uuid
 from datetime import datetime
 from pathlib import Path
 
+from backend.src.constants import SUPPORTED_EXTENSIONS
+
 KB_ROOT = Path("data/knowledge_bases")
 KB_ROOT.mkdir(parents=True, exist_ok=True)
 META = KB_ROOT / "_meta.json"
+
+SUPPORTED = SUPPORTED_EXTENSIONS
 
 
 def _load() -> list[dict]:
@@ -39,6 +43,18 @@ def delete(kb_id: str) -> bool:
 
 def docs_dir(kb_id: str) -> Path:
     return KB_ROOT / kb_id / "documents"
+
+
+def safe_document_path(kb_id: str, filename: str) -> Path:
+    """Resolve a single uploaded filename without allowing directory escape."""
+
+    if not filename or Path(filename).name != filename:
+        raise ValueError("文件名不能包含路径")
+    root = docs_dir(kb_id).resolve()
+    target = (root / filename).resolve()
+    if target.parent != root:
+        raise ValueError("非法文件路径")
+    return target
 
 
 def graph_path(kb_id: str) -> Path:

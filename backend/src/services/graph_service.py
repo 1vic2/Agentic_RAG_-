@@ -1,9 +1,8 @@
-from typing import Any
+import logging
 
-from backend.src.config import settings
-from backend.src.utils.helpers import get_logger
+from backend.src.services.graph_query import format_graph_evidence, graph_query
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class GraphService:
@@ -13,6 +12,7 @@ class GraphService:
     def _connect(self):
         if self._driver:
             return
+        from backend.src.config import settings
         from neo4j import GraphDatabase
         self._driver = GraphDatabase.driver(settings.neo4j_uri, auth=(settings.neo4j_user, settings.neo4j_password))
         self._driver.verify_connectivity()
@@ -28,28 +28,16 @@ class GraphService:
                 es = [{"src": e["source"], "dst": e["target"], "lbl": e.get("label", "")} for e in edges]
                 s.run("UNWIND $es AS e MATCH (a:Entity {text: e.src, kb_id: $kb}) MATCH (b:Entity {text: e.dst, kb_id: $kb}) MERGE (a)-[r:RELATION {type: e.lbl, kb_id: $kb}]->(b)", es=es, kb=kb_id)
 
-    def search(self, q: str, k: int = 10) -> list[dict]:
+    def search(self, q: str, kb_id: str = "", k: int = 10) -> list[dict]:
         self._connect()
-        cypher = self._to_cypher(q)
+        cypher, params = graph_query(q, kb_id)
         try:
             with self._driver.session() as s:
-                return [self._fmt(r) for r in s.run(cypher)[:k]]
+                records = list(s.run(cypher, **params))[:k]
+                return [format_graph_evidence(dict(record), i) for i, record in enumerate(records)]
         except Exception as e:
             logger.warning(f"Cypher fail: {e}")
             return []
-
-    @staticmethod
-    def _to_cypher(q: str) -> str:
-        ql = q.lower()
-        if any(w in ql for w in ["所有", "全部", "列出"]):
-            return "MATCH (n:Entity) RETURN n.text, n.label LIMIT 50"
-        if any(w in ql for w in ["关系", "关联", "连接"]):
-            return "MATCH (a)-[r:RELATION]->(b) RETURN a.text, r.type, b.text LIMIT 50"
-        return "MATCH (n) OPTIONAL MATCH (n)-[r]->(m) RETURN n.text, n.label, r.type, m.text LIMIT 50"
-
-    @staticmethod
-    def _fmt(r: Any) -> dict:
-        return {k: r[k] for k in r.keys() if r[k] is not None}
 
     def delete(self, kb_id: str):
         self._connect()

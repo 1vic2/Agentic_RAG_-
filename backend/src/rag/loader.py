@@ -63,11 +63,33 @@ class DocumentLoader:
                     return normalize_whitespace(txt)
             except Exception as e:
                 logger.warning(f"VLM 描述失败，尝试 OCR: {e}")
+        # PDF 优先用 pypdf 解析（轻量、无系统依赖）
+        if p.suffix.lower() == ".pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(str(p))
+                texts = []
+                for page in reader.pages:
+                    t = page.extract_text()
+                    if t and t.strip():
+                        texts.append(t.strip())
+                if texts:
+                    logger.info(f"pypdf 解析成功: {p.name} ({len(reader.pages)}页)")
+                    return normalize_whitespace("\n\n".join(texts))
+                logger.warning(f"PDF 无文本层（可能是扫描件）: {p.name}")
+            except Exception as e:
+                logger.warning(f"pypdf 解析失败 {p.name}: {e}")
         try:
             from unstructured.partition.auto import partition
             return normalize_whitespace("\n\n".join(str(e.text) for e in partition(str(p)) if hasattr(e, "text") and e.text))
         except ImportError:
-            return normalize_whitespace(p.read_text("utf-8", errors="ignore"))
+            text_formats = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".xml"}
+            if p.suffix.lower() in text_formats:
+                return normalize_whitespace(p.read_text("utf-8", errors="ignore"))
+            logger.error(
+                f"{p.name}: 缺少可选文档解析依赖，请安装 backend/requirements-docs.txt"
+            )
+            return ""
         except Exception as e:
             logger.error(f"{p.name}: {e}")
             return ""

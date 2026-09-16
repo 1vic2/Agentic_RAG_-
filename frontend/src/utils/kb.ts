@@ -4,8 +4,9 @@ let _cache: any[] | null = null
 export async function getKBList(): Promise<any[]> {
   if (_cache) return _cache
   const r = await (await fetch('/api/knowledge-bases')).json()
-  _cache = r.knowledge_bases || []
-  return _cache
+  const knowledgeBases: any[] = r.knowledge_bases || []
+  _cache = knowledgeBases
+  return knowledgeBases
 }
 
 export function clearKBCache() { _cache = null }

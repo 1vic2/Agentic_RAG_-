@@ -1,5 +1,5 @@
 <template>
-  <div class="content" style="padding:0;max-width:100%;flex:1;display:flex;flex-direction:column;min-height:0">
+  <div class="content graph-page" style="padding:0;max-width:100%;flex:1;display:flex;flex-direction:column;min-height:0">
     <div style="display:flex;flex-direction:column;flex:1;min-height:0">
       <div style="display:flex;align-items:center;gap:12px;padding:10px 20px;flex-shrink:0;background:var(--bg-surface);border-bottom:1px solid var(--border)">
         <span style="font-weight:700;font-size:13px;text-transform:uppercase;letter-spacing:.5px">知识图谱</span>
@@ -9,12 +9,12 @@
             <div v-for="kb in kbs" :key="kb.id" @click="sd=false;sel=kb.id;load()" class="sidebar-btn" style="font-size:12px;padding:6px 10px" :style="sel===kb.id?'background:rgba(0,188,212,.06);color:var(--cyan);border-color:rgba(0,188,212,.15)':''">{{kb.name}}</div>
           </div>
         </div>
-        <button @click="build" :disabled="!sel||building" style="padding:4px 12px;border-radius:var(--radius);background:var(--cyan);color:#000;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;transition:all .2s cubic-bezier(.25,.46,.45,.94);border:1px solid transparent" @mouseenter="$event.target.style.filter='brightness(1.15)'" @mouseleave="$event.target.style.filter=''">
+        <button @click="build" :disabled="!sel||building" class="btn-primary">
           <svg v-if="building" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation:spin 1s linear infinite"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4"/></svg>
           <span>{{building?'构建中...':'构建图谱'}}</span>
         </button>
-        <button v-if="nodes.length" @click="del" style="padding:4px 12px;border-radius:var(--radius);border:1px solid var(--border);color:var(--text-3);font-size:12px;text-transform:uppercase;letter-spacing:.5px;transition:all .2s cubic-bezier(.25,.46,.45,.94)" @mouseenter="$event.target.style.borderColor='var(--border-light)';$event.target.style.color='var(--text)'" @mouseleave="$event.target.style.borderColor='var(--border)';$event.target.style.color='var(--text-3)'">删除图谱</button>
-        <button v-if="nodes.length" @click="resetZoom" style="padding:4px 12px;border-radius:var(--radius);border:1px solid var(--border);color:var(--text-3);font-size:12px;text-transform:uppercase;letter-spacing:.5px;transition:all .2s cubic-bezier(.25,.46,.45,.94)" @mouseenter="$event.target.style.borderColor='var(--border-light)';$event.target.style.color='var(--text)'" @mouseleave="$event.target.style.borderColor='var(--border)';$event.target.style.color='var(--text-3)'">重置视角</button>
+        <button v-if="nodes.length" @click="del" class="btn-ghost">删除图谱</button>
+        <button v-if="nodes.length" @click="resetZoom" class="btn-ghost">重置视角</button>
         <span v-if="msg" style="font-size:12px;color:var(--amber);padding:2px 8px;background:rgba(255,143,0,.1);border-radius:2px;border:1px solid rgba(255,143,0,.2);font-family:var(--mono)">{{msg}}</span>
         <span v-if="nodes.length" style="margin-left:auto;font-size:11px;color:var(--text-3);font-family:var(--mono)">{{nodes.length}} 节点 · {{edges.length}} 关系</span>
       </div>
@@ -39,7 +39,7 @@ async function load() {
 }
 async function build() {
   if (!sel.value||building.value) return; building.value = true; msg.value = ''
-  try { const r = await (await fetch(`/api/knowledge-bases/${sel.value}/graph/build`,{method:'POST'})).json(); msg.value = r.entities?`完成: ${r.entities} 实体, ${r.relations} 关系`:'失败'; await load() }
+  try { const r = await (await fetch(`/api/knowledge-bases/${sel.value}/graph/build`,{method:'POST'})).json(); msg.value = Number.isFinite(r.entities)?`完成: ${r.entities} 实体, ${r.relations} 关系${r.warnings?.length ? `；${r.warnings.join('，')}` : ''}`:'失败'; await load() }
   catch { msg.value = '构建失败' }; building.value = false; setTimeout(() => msg.value = '', 5000)
 }
 async function del() {

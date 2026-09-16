@@ -1,302 +1,389 @@
-# AgenticRAG — 企业级智能问答系统 🧠
+# AgenticRAG
 
-基于 FastAPI + Vue 3 + LangGraph + ChromaDB 构建的企业级 RAG（检索增强生成）问答系统。支持知识库管理、多源检索、知识图谱推理、联网搜索与深度 Agent 推理，通过 SSE 实时流式输出回答。
+一个面向企业文档的多源知识库问答系统。项目使用 **FastAPI + Vue 3 + LangGraph + ChromaDB**，将文档解析、向量检索、重排、知识图谱、联网搜索和可追溯回答串成一个可运行的 RAG 应用。
 
-## 功能特性 ✨
-
-- **📚 知识库管理** — 创建/删除/上传/索引，全生命周期管理
-- **🔍 语义检索** — BGE-M3 稠密向量 + Cross-encoder 重排，精准匹配
-- **🌐 联网搜索** — Tavily 实时 Web 查询，联网信息兜底
-- **🕸️ 知识图谱** — LLM 自动抽取实体关系 + Neo4j 存储 + d3 可视化
-- **🧠 深度 Agent** — LangGraph 多步推理路由，复杂问题拆解
-- **⚡ 流式对话** — SSE 实时推送，逐 token 输出
-- **🔒 安全渲染** — DOMPurify 净化 Markdown，XSS 防护
-- **🔄 对话历史** — 自动保存上下文，支持连续追问
-
-## 技术栈 📋
-
-| 层级    | 技术                                    |
-| ----- | ------------------------------------- |
-| 后端框架  | FastAPI + Uvicorn                     |
-| AI 框架 | LangChain + LangGraph                 |
-| 大语言模型 | OpenAI 兼容                             |
-| 向量库   | ChromaDB（BGE-M3 嵌入 + BGE-reranker 重排） |
-| 图数据库  | Neo4j                                 |
-| 联网搜索  | Tavily API                            |
-| 前端框架  | Vue 3 + TypeScript                    |
-| 构建工具  | Vite                                  |
-| 图谱可视化 | d3.js forceSimulation                 |
-| 流式通信  | SSE（sse-starlette）                    |
-
-## 架构概览 🏗️
+> 项目定位：适合作为 Agentic RAG、LangGraph 工作流、SSE 流式交互和知识库工程化的学习与面试项目。
 
 ![系统架构概览](Architecture%20Overview.jpg)
 
-## 系统流程 🔄
-
 ![系统流程图](Flow%20Chart.jpg)
 
-## 快速开始 🚀
+## 项目亮点
 
-### 前置条件
+- **知识库全生命周期**：创建、上传、删除、索引、重建和按知识库隔离检索。
+- **混合信息来源**：本地 Chroma 向量检索、BGE-M3 嵌入、BGE Reranker 重排、Neo4j 图谱和 Tavily 联网搜索。
+- **两种 Agent 工作模式**：
+  - 快速模式：LLM 规划工具路线后按顺序执行，延迟和成本更可控。
+  - 深度模式：LangGraph 受控 ReAct 循环，执行 `decide → act → observe → decide`，最多调用 3 个不同工具。
+- **可靠的流式问答**：SSE 推送状态、工具开始/完成、token、错误和最终证据。
+- **可追溯回答**：回答中的 `[n]` 引用可以定位到对应证据卡片。
+- **工程化边界**：请求级 `kb_id` 隔离、SQLite 会话、稳定向量片段 ID、上传路径校验、取消请求和模型就绪检查。
+- **可评测**：提供 34 道固定题集，覆盖事实题、跨文档题、关系题、追问和拒答题。
+
+## 技术栈
+
+| 层次 | 技术 | 作用 |
+| --- | --- | --- |
+| Web API | FastAPI、Uvicorn、Pydantic | REST API、SSE、请求校验 |
+| Agent 编排 | LangGraph、LangChain Core | 快速路由与深度 ReAct 状态图 |
+| 大语言模型 | OpenAI 兼容 API | 工具决策和最终答案生成 |
+| 文档处理 | pypdf、LangChain Text Splitters | 多格式解析、切片和元数据保留 |
+| Embedding | BGE-M3、FlagEmbedding、PyTorch | 文档和查询向量化 |
+| Reranking | BGE Reranker v2 M3 | 对候选证据重新排序 |
+| 向量数据库 | ChromaDB | 本地向量持久化和相似度搜索 |
+| 图数据库 | Neo4j | 实体关系存储和图谱查询 |
+| Web Search | Tavily | 实时联网搜索 |
+| Frontend | Vue 3、TypeScript、Vite | 聊天、知识库和图谱管理界面 |
+| Visualization | D3.js Canvas | 知识图谱力导向可视化 |
+| Streaming | sse-starlette、Fetch SSE parser | 检索过程和回答流式传输 |
+| Testing | Python unittest、Vitest | 后端契约测试和前端交互测试 |
+
+## 整体工作流程
+
+### 1. 文档入库和索引
+
+```text
+上传文件
+  ↓
+文件名和扩展名校验
+  ↓
+DocumentLoader 解析文本
+  ↓
+文本切片并保留 source / kb_id
+  ↓
+BGE-M3 生成向量
+  ↓
+写入 ChromaDB
+  ↓
+可选：LLM 抽取实体关系 → Neo4j
+```
+
+同一个知识库重建索引时，系统使用稳定的片段 ID 清理旧片段，避免重复追加；不同知识库的向量查询通过 `kb_id` 过滤。
+
+### 2. 快速模式
+
+```text
+用户问题
+  ↓
+LLM 规划工具路线
+  ↓
+vector / graph / web 按路线执行
+  ↓
+收集证据
+  ↓
+LLM 根据证据生成带 [n] 引用的答案
+```
+
+快速模式适合普通事实查询和对延迟敏感的场景。规划结果经过 allowlist、去重和回退校验，非法输出会回退到向量检索。
+
+### 3. 深度 ReAct 模式
+
+```text
+用户问题
+  ↓
+decide：模型选择工具或结束
+  ↓
+act：执行 vector / graph / web
+  ↓
+observe：工具结果写回状态
+  ↓
+decide：模型根据新证据继续判断
+  ↓
+最多 3 轮，或模型输出 final
+  ↓
+统一生成最终回答
+```
+
+当前 ReAct 是有界实现：
+
+- 每次最多 3 个工具轮次。
+- 同一个工具不会重复调用。
+- `use_web=false` 或未配置 Tavily 时不会暴露 web 工具。
+- 每个工具都使用当前请求的 `kb_id`。
+- 工具失败会记录失败时间线，同时保留已获得证据。
+- ReAct 决策失败会回退到普通向量检索。
+- 深度 ReAct 模式不会再叠加固定的 `retry_retrieval`，避免重复检索。
+
+### 4. SSE 流式过程
+
+前端请求 `POST /api/query/stream` 后，后端会按顺序推送：
+
+```text
+start
+  ↓
+status: 检索中
+  ↓
+tool_start / tool_end
+  ↓
+status: 生成回答
+  ↓
+token × N
+  ↓
+done(answer, evidence)
+```
+
+异常时会推送 `error`，随后仍发送 `done`，前端可以把失败内容和工具状态保留在当前会话中。
+
+## 效果展示
+
+### 界面功能
+
+| 页面 | 展示内容 |
+| --- | --- |
+| 智能问答 | 知识库选择、快速/ReAct 深度模式、联网开关、补检索开关、流式回答 |
+| 证据面板 | 来源文件、相似度、证据正文、可点击 `[n]` 引用 |
+| 工具时间线 | 向量、图谱、联网和 ReAct 工具的运行中、完成、失败状态 |
+| 知识库 | 创建知识库、拖拽上传、多格式文档列表、索引和删除 |
+| 知识图谱 | Neo4j 实体关系、节点/关系统计、D3.js 缩放和拖拽 |
+| 本地诊断 | 模型文件、Python 核心模块和 `/health/ready` 状态检查 |
+
+### 已完成的本地验证
+
+- 后端单元测试：**59 项通过**。
+- 前端 Vitest：**13 项通过**。
+- 前端 TypeScript 检查和 Vite 生产构建：**通过**。
+- Python `compileall`：**通过**。
+- 固定题集离线校验：**34 道题通过格式和来源配置检查**。
+- 本地 BGE-M3 和 Reranker：已实际完成预热和向量检索。
+- 演示知识库的 31 道有预期来源题：来源命中 **31/31**。
+- SSE 实际验证：能收到工具开始、工具结束、错误和完成事件。
+- 当前外部 LLM 连接曾返回 `Connection error`，因此尚未宣称真实生成质量提升；真实 LLM 质量需要运行固定题集进行 quick / deep 对照。
+
+## 快速开始
+
+### 环境要求
 
 - Python 3.11+
 - Node.js 18+
-- OpenAI API Key（或兼容的第三方服务）
-- Neo4j 数据库（可选，图谱功能需要）
+- 一个 OpenAI 兼容的 LLM API
+- BGE-M3 和 BGE Reranker 模型
+- Neo4j 可选：不开启图谱时可以不启动
+- Tavily 可选：不开启联网搜索时可以不配置
 
-### 1. 安装后端
+后端必须从**项目根目录**启动，因为 `.env` 和本地模型相对路径按根目录解析。
 
-```bash
-pip install -r backend/requirements.txt
+### 安装依赖
+
+```powershell
+# 后端
+python -m pip install -r backend/requirements.txt
+
+# 复杂 Office / 邮件格式的可选解析依赖
+python -m pip install -r backend/requirements-docs.txt
+
+# 前端
+Set-Location frontend
+npm install
 ```
 
-### 2. 配置环境变量
+如果使用 Conda：
 
-复制 `.env.example` 为 `.env`，填入配置：
+```powershell
+conda activate DLPR
+python -m pip install -r backend/requirements.txt
+```
+
+DLPR 环境需要包含 FastAPI、Uvicorn、LangChain、LangGraph、ChromaDB 和 FlagEmbedding 等核心模块。可以先运行本地诊断脚本。
+
+### 配置
+
+复制模板：
+
+```powershell
+Copy-Item backend/.env.example .env
+```
+
+按实际环境修改：
 
 ```env
-OPENAI_API_KEY=sk-xxx
+OPENAI_API_KEY=your-key
 OPENAI_API_BASE=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
 
-TAVILY_API_KEY=tvly-xxx
-
+TAVILY_API_KEY=
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=password
+
+# 已有本地模型时可以使用项目内路径
+BGE_MODEL_PATH=models/bge-m3
+BGE_RERANKER_PATH=models/bge-reranker-v2-m3
+HF_HUB_OFFLINE=false
 
 HOST=0.0.0.0
 PORT=8000
 ```
 
-> ⚠️ `.env` 文件包含敏感 API 密钥，已默认加入 `.gitignore`。请勿手动将其加入版本控制。
+不要提交真实 `.env` 或任何 API 密钥；项目已将它们加入 `.gitignore`。
 
-### 3. 启动后端
+### 方式一：一键本地启动
 
-```bash
-python -m backend.src.main
-# 终端输出: Uvicorn running on http://0.0.0.0:8000
+Windows PowerShell：
+
+```powershell
+./scripts/check-local.ps1 -Python ''C:\path\to\python.exe''
+./scripts/run-local.ps1 -Python ''C:\path\to\python.exe''
 ```
 
-验证后端：
+脚本会检查核心模块和本地模型文件，启动后端和 Vite，等待：
 
-```bash
-curl http://localhost:8000/health
-# {"status":"ok"}
+- 后端：`http://127.0.0.1:8000`
+- 前端：`http://127.0.0.1:5173`
+- 就绪检查：`http://127.0.0.1:8000/health/ready`
+
+按 Ctrl+C 只停止脚本自己启动的进程。日志写入被 Git 忽略的 `data/local-run/`。
+
+### 方式二：分别启动
+
+终端一：
+
+```powershell
+python -m uvicorn backend.src.main:app --host 127.0.0.1 --port 8000
 ```
 
-### 4. 安装并启动前端
+终端二：
 
-```bash
-cd frontend
-npm install
+```powershell
+Set-Location frontend
 npm run dev
-# 终端输出: Local: http://localhost:5173
 ```
 
-### 5. 使用
+打开 `http://127.0.0.1:5173`，创建知识库 → 上传文档 → 索引 → 开始问答。
 
-打开浏览器访问 `http://localhost:5173`，创建知识库 → 上传文档 → 索引 → 开始问答。
+## 使用示例
 
-## 使用指南 📖
+### 创建知识库
 
-| 步骤 | 操作    | 说明                                |
-| -- | ----- | --------------------------------- |
-| 1  | 创建知识库 | 侧边栏点击「+ 新建」，输入名称和描述               |
-| 2  | 上传文档  | 支持 PDF / Word / Excel / PPT / 纯文本 |
-| 3  | 索引文档  | 上传后点击「索引」，自动切片+向量化                |
-| 4  | 开启聊天  | 输入问题，可选联网/深度模式                    |
-| 5  | 查看图谱  | 构建知识图谱后，可视化查看实体关系                 |
-| 6  | 追问    | 基于对话历史自然延续                        |
-
-## 项目结构 📁
-
-```
-AgenticRAG/
-├── backend/
-│   ├── Dockerfile                    # 后端容器镜像
-│   └── src/
-│       ├── main.py                   # FastAPI 应用入口 + SSE 端点
-│       ├── config.py                 # 环境配置加载（.env → Settings）
-│       ├── models.py                 # Pydantic 数据模型
-│       ├── constants.py              # 常量定义
-│       ├── agent/
-│       │   └── orchestrator.py       # LangGraph Agent 编排器
-│       ├── rag/
-│       │   ├── embedder.py           # BGE-M3 嵌入模型封装
-│       │   ├── retriever.py          # 检索器（稠密 + 重排）
-│       │   ├── store.py              # ChromaDB 向量存储
-│       │   └── loader.py             # 文档加载器
-│       ├── services/
-│       │   ├── index_service.py      # 索引服务
-│       │   ├── kb_service.py         # 知识库管理服务
-│       │   ├── graph_service.py      # Neo4j 图服务
-│       │   └── sse_manager.py        # SSE 事件管理
-│       ├── tools/
-│       │   └── extraction_tool.py    # 实体关系抽取工具
-│       └── utils/
-│           └── helpers.py            # 公共工具函数
-├── frontend/
-│   └── src/
-│       ├── main.ts                   # Vue 应用入口
-│       ├── App.vue                   # 根组件
-│       ├── style.css                 # 全局样式 + CSS 变量
-│       ├── stores/
-│       │   └── chat.ts               # 会话状态管理
-│       ├── utils/
-│       │   ├── sse.ts                # SSE 流解析
-│       │   └── kb.ts                 # 知识库 API 封装
-│       ├── types/
-│       │   └── research.ts           # TypeScript 类型定义
-│       ├── views/
-│       │   ├── HomeView.vue          # 聊天主页
-│       │   ├── KBView.vue            # 知识库管理页
-│       │   └── GraphView.vue         # 图谱可视化页
-│       └── components/
-│           └── MarkdownViewer.vue    # Markdown 安全渲染
-├── data/
-│   ├── chroma/                       # ChromaDB 向量数据
-│   └── knowledge_bases/
-│       ├── _meta.json                # 知识库元数据
-│       └── {kb_id}/
-│           ├── documents/            # 上传的文档
-│           └── graph.json            # 图谱数据
-├── .env.example                      # 环境变量模板
-├── .gitignore                        # Git 忽略规则
-└── README.md
+```powershell
+$body = @{name=''产品文档''; description=''内部产品资料''} | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:8000/knowledge-bases -Method Post -ContentType ''application/json'' -Body $body
 ```
 
-## API 文档 📡
-
-### GET `/health`
-
-健康检查。
-
-**响应：**
-
-```json
-{"status": "ok"}
-```
-
-### POST `/query`
-
-问答请求（非流式）。
-
-**请求体：**
+### 问答请求
 
 ```json
 {
-  "question": "年假几天",
+  "question": "查询网关默认多久超时？",
+  "conversation_id": "demo-session",
+  "kb_id": "your-kb-id",
   "use_web": false,
   "deep_mode": false,
-  "conversation_id": ""
+  "retry_retrieval": false
 }
 ```
 
-**参数说明：**
+深度 ReAct 只需将 `deep_mode` 改为 `true`：
 
-| 参数                | 类型      | 默认值   | 说明            |
-| ----------------- | ------- | ----- | ------------- |
-| `question`        | string  | -     | 问题内容，必填       |
-| `use_web`         | boolean | false | 启用联网搜索        |
-| `deep_mode`       | boolean | false | 启用深度 Agent 推理 |
-| `conversation_id` | string  | ""    | 对话 ID，续传上下文   |
-
-### POST `/query/stream`
-
-问答请求（SSE 流式输出）。请求体同 `/query`，返回 `EventSource` 流，事件类型：
-
-| 事件       | 说明                 |
-| -------- | ------------------ |
-| `start`  | 会话开始，携带 `sid`      |
-| `status` | 阶段状态（检索中… / 生成回答…） |
-| `token`  | 生成文本片段             |
-| `done`   | 回答完成，携带完整回答 + 证据   |
-| `error`  | 错误信息               |
-
-### 知识库 API
-
-| 方法     | 路径                                              | 说明     |
-| ------ | ----------------------------------------------- | ------ |
-| POST   | `/knowledge-bases`                              | 创建知识库  |
-| GET    | `/knowledge-bases`                              | 知识库列表  |
-| DELETE | `/knowledge-bases/{kb_id}`                      | 删除知识库  |
-| POST   | `/knowledge-bases/{kb_id}/upload`               | 上传文档   |
-| GET    | `/knowledge-bases/{kb_id}/documents`            | 文档列表   |
-| DELETE | `/knowledge-bases/{kb_id}/documents/{filename}` | 删除文档   |
-| POST   | `/knowledge-bases/{kb_id}/index`                | 索引文档   |
-| POST   | `/knowledge-bases/{kb_id}/graph/build`          | 构建知识图谱 |
-| GET    | `/knowledge-bases/{kb_id}/graph`                | 获取图谱数据 |
-| DELETE | `/knowledge-bases/{kb_id}/graph`                | 删除图谱   |
-| GET    | `/knowledge-bases/index/status`                 | 索引状态统计 |
-
-## 配置参考 ⚙️
-
-所有配置项通过项目根目录下的 `.env` 文件加载：
-
-| 环境变量                | 默认值                         | 说明                |
-| ------------------- | --------------------------- | ----------------- |
-| `OPENAI_API_KEY`    | -                           | OpenAI API 密钥（必填） |
-| `OPENAI_API_BASE`   | `https://api.openai.com/v1` | API 基础地址          |
-| `LLM_MODEL`         | `gpt-4o-mini`               | 模型名称              |
-| `TAVILY_API_KEY`    | -                           | Tavily 搜索 API 密钥  |
-| `NEO4J_URI`         | `bolt://localhost:7687`     | Neo4j 连接地址        |
-| `NEO4J_USER`        | `neo4j`                     | Neo4j 用户名         |
-| `NEO4J_PASSWORD`    | `password`                  | Neo4j 密码          |
-
-| `HOST`              | `0.0.0.0`                   | 服务监听地址            |
-| `PORT`              | `8000`                      | 服务端口              |
-
-## Docker 部署 🐳
-
-一键启动后端 + Neo4j：
-
-```bash
-docker compose up -d
+```json
+{
+  "question": "哪个团队负责维护平台？",
+  "kb_id": "your-kb-id",
+  "deep_mode": true,
+  "use_web": false
+}
 ```
 
-包含两个服务：
+### 固定题集评测
 
-| 服务 | 镜像 | 端口 | 说明 |
-|------|------|------|------|
-| `backend` | 本地构建 | `8000` | FastAPI 应用 |
-| `neo4j` | `neo4j:5-community` | `7474`(UI) `7687`(bolt) | 知识图谱库 |
+```powershell
+# 先检查题集
+python -m evals.run --validate
 
-**数据持久化**：
-- `./data/` → 向量库 + 文档持久化到宿主机
-- `hf_cache` volume → BGE 模型缓存，重启不重下
-- `neo4j_data` volume → Neo4j 数据库持久化
+# quick：快速顺序路由
+python -m evals.run --kb-id your-kb-id --mode quick --output data/eval-quick.json
 
-> ⚠️ 首次启动需联网下载 BGE-M3 模型（~2.2GB），后续使用缓存。
+# deep：受控 ReAct
+python -m evals.run --kb-id your-kb-id --mode deep --output data/eval-deep-react.json
 
-## 本地开发 🛠️
-
-### 热重载开发
-
-```bash
-# 终端 1：后端（热重载）
-uvicorn backend.src.main:app --reload --host 0.0.0.0 --port 8000
-
-# 终端 2：前端（HMR + API 代理）
-cd frontend && npm run dev
+# 补检索对照实验
+python -m evals.run --kb-id your-kb-id --mode quick --retry-retrieval --output data/eval-quick-retry.json
 ```
 
-### 构建前端生产版本
+评测脚本不会自动上传文件，也不会改动已有知识库。它会输出按题型聚合的来源命中、参考短语匹配、拒答判断和耗时；这些指标不能替代人工或 LLM judge 的事实性评估。
 
-```bash
-cd frontend
-npm run build
-# 产出在 frontend/dist/
+## API 概览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/health` | API 进程健康 |
+| GET | `/health/ready` | 嵌入模型是否就绪 |
+| POST | `/query` | 非流式问答 |
+| POST | `/query/stream` | SSE 流式问答 |
+| POST | `/knowledge-bases` | 创建知识库 |
+| GET | `/knowledge-bases` | 知识库列表 |
+| POST | `/knowledge-bases/{id}/upload` | 上传文档 |
+| GET | `/knowledge-bases/{id}/documents` | 文档列表 |
+| POST | `/knowledge-bases/{id}/index` | 建立向量索引 |
+| POST | `/knowledge-bases/{id}/graph/build` | 构建知识图谱 |
+| GET | `/knowledge-bases/{id}/graph` | 获取图谱 |
+| GET | `/knowledge-bases/index/status` | 索引统计 |
+
+## 项目结构
+
+```text
+AgenticRAG/
+├── backend/src/
+│   ├── main.py                    # FastAPI API、SSE、检索入口
+│   ├── models.py                  # 请求模型
+│   ├── agent/
+│   │   ├── react_agent.py         # 深度 ReAct：decide/act/observe 循环
+│   │   ├── orchestrator.py        # 快速模式顺序工具路由
+│   │   ├── retry_policy.py        # 可选的一次指代补检索
+│   │   └── routing.py             # 路线过滤和状态转移
+│   ├── rag/
+│   │   ├── loader.py              # 文档解析和切片
+│   │   ├── embedder.py            # BGE-M3
+│   │   ├── retriever.py           # 向量检索和 Reranker
+│   │   └── store.py               # ChromaDB
+│   ├── services/
+│   │   ├── graph_service.py       # Neo4j 图谱服务
+│   │   ├── index_service.py       # 索引编排
+│   │   ├── session_service.py     # SQLite 会话
+│   │   ├── tool_progress.py       # SSE 工具进度
+│   │   └── web_search.py          # Tavily 结果标准化
+│   └── tests/                     # 后端契约和集成测试
+├── frontend/src/
+│   ├── views/HomeView.vue         # 聊天和 ReAct 控制
+│   ├── views/KBView.vue           # 知识库管理
+│   ├── views/GraphView.vue        # 图谱可视化
+│   ├── components/MarkdownViewer.vue
+│   └── utils/sse.ts               # SSE 解析和会话状态
+├── evals/                         # 固定题集、夹具和评测脚本
+├── scripts/
+│   ├── check-local.ps1            # 只读环境诊断
+│   └── run-local.ps1              # 一键本地启动
+├── docs/                          # 面试指南、设计和联调记录
+├── Architecture Overview.jpg
+├── Flow Chart.jpg
+└── docker-compose.yml
 ```
 
-## 注意事项 ⚠️
+## 常见问题
 
-- **首次启动** 自动下载 BGE-M3 嵌入模型（\~2.2GB），模型缓存到 `~/.cache/huggingface/hub/`
-- **网络环境**：如果无法访问 HuggingFace，设置环境变量 `HF_HUB_OFFLINE=1` 使用本地缓存
-- **Neo4j**：知识图谱功能需要 Neo4j 数据库，不启用不影响基础问答
-- **数据文件**：上传的文档存储在 `data/knowledge_bases/` 目录
+### 为什么前端不是 React？
 
-## License 📄
+本项目当前前端使用 Vue 3 + TypeScript；React 是参考项目的前端技术，不是本项目依赖。
+
+### 项目是否使用 ReAct？
+
+是。深度模式使用 LangGraph 手动构建的受控 ReAct 状态图；快速模式仍是固定路线的 Plan-and-Execute。两者共用向量、图谱、联网工具和证据格式。
+
+### 没有 Neo4j 能不能运行？
+
+可以。基础文档上传、索引、向量检索和问答不依赖 Neo4j；只有构建/查询图谱时需要 Neo4j。
+
+### 没有 Tavily 能不能运行？
+
+可以。将 `use_web=false`，或不配置 `TAVILY_API_KEY`，系统仍可使用向量和图谱工具。
+
+## 当前边界
+
+- 真实生成质量取决于可用的 OpenAI 兼容 LLM；本地检索命中不等于答案事实性。
+- ReAct 最多三轮且禁止重复工具，优先控制成本和延迟；没有独立的答案反思或 LLM judge。
+- 图谱查询目前是通用参数化关系查询，还没有实体链接和多跳路径规划。
+- SQLite、文件元数据和本地 ChromaDB 面向单机演示；多进程部署需要集中式会话和任务队列。
+- Docker 配置用于可复现部署，本地开发不强制使用 Docker。
+
+## License
 
 MIT

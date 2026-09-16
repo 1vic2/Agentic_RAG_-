@@ -3,6 +3,8 @@ uvicorn[standard]
 langchain-core>=0.3.17
 langchain-openai>=0.2.6
 langchain-text-splitters>=1.1.0
+langgraph>=0.2.0
+httpx>=0.27.0
 pydantic>=2.0
 pydantic-settings>=2.0
 sse-starlette
@@ -14,3 +16,4 @@ tavily-python
 transformers>=4.40.0
 torch>=2.0.0
 python-multipart
+pypdf>=5.0.0

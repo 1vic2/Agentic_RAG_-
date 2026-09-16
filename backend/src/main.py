@@ -1,25 +1,33 @@
+import asyncio
 import shutil
-from contextlib import asynccontextmanager
+import time
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from httpx import Client
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from sse_starlette.sse import EventSourceResponse
 
 from backend.src.config import settings
+from backend.src.agent.retry_policy import merge_evidence, retry_query
 from backend.src.models import CreateKBRequest, QueryRequest
 from backend.src.rag.retriever import retriever
 from backend.src.services import kb_service
 from backend.src.services.index_service import index_kb
+from backend.src.services.kb_locks import knowledge_base_lock
+from backend.src.services.session_service import SessionStore, format_history
+from backend.src.services.tool_progress import progress_events, track_tool
+from backend.src.services.web_search import search_web
 from backend.src.services.sse_manager import sse
 from backend.src.utils.helpers import get_logger
 
 logger = get_logger(__name__)
-sessions: dict[str, list[dict]] = {}
+session_store = SessionStore()
 
 
 @asynccontextmanager
@@ -42,12 +50,24 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/health/ready")
+def health_ready():
+    from backend.src.rag.embedder import embedder
+    state = embedder.readiness
+    return JSONResponse(
+        status_code=200 if state == "ready" else 503,
+        content={"status": "ready" if state == "ready" else "unavailable" if state == "error" else "warming", "embedding": state},
+    )
+
+
 @app.post("/query")
 async def query(req: QueryRequest):
     sid = req.conversation_id or str(uuid4())
-    ev = await _retrieve(req.question, req.use_web, req.deep_mode)
-    ans = _generate(req.question, ev)
-    sessions.setdefault(sid, []).append({"q": req.question, "a": ans, "ev": ev})
+    history = format_history(session_store.recent(sid))
+    session_store.append(sid, "user", req.question)
+    ev = await _retrieve(req.question, req.use_web, req.deep_mode, history, kb_id=req.kb_id, retry_retrieval=req.retry_retrieval)
+    ans = await asyncio.to_thread(_generate, req.question, ev, history)
+    session_store.append(sid, "assistant", ans, ev)
     return {"answer": ans, "conversation_id": sid, "evidence": ev}
 
 
@@ -59,59 +79,92 @@ async def query_stream(req: QueryRequest, request: Request):
         if await request.is_disconnected():
             return
         yield sse.start(sid)
-        # 构建对话历史
-        prev = sessions.get(sid, [])
-        history = "\n".join(f"{'用户' if s['q'] else '助手'}: {s.get('q') or s.get('a','')[:100]}" for s in prev[-4:])
-        yield sse.status("检索中…")
-        ev = await _retrieve(req.question, req.use_web, req.deep_mode, history)
-        yield sse.status("生成回答…")
-        llm, msg = _build_llm(True), _build_msg(req.question, ev, history)
+        history = format_history(session_store.recent(sid))
+        session_store.append(sid, "user", req.question)
+        ev: list[dict] = []
         ans = ""
+        assistant_saved = False
         try:
+            yield sse.status("检索中…")
+            async with aclosing(progress_events(
+                lambda emit, cancelled: _retrieve(req.question, req.use_web, req.deep_mode, history, kb_id=req.kb_id, progress=emit, cancelled=cancelled, retry_retrieval=req.retry_retrieval)
+            )) as events:
+                async for event in events:
+                    if event["stage"] == "start":
+                        yield sse.tool_start(sid, event["tool"])
+                    elif event["stage"] == "end":
+                        yield sse.tool_end(sid, event["tool"], event["ok"], event["count"], event["elapsed_ms"])
+                    else:
+                        ev = event["result"]
+            if await request.is_disconnected():
+                cancelled_answer = _cancelled_answer(ans)
+                session_store.append(sid, "assistant", cancelled_answer, ev)
+                return
+            yield sse.status("生成回答…")
+            llm, msg = _build_llm(True), _build_msg(req.question, ev, history)
             async for c in llm.astream(msg):
                 if await request.is_disconnected():
-                    break
+                    cancelled_answer = _cancelled_answer(ans)
+                    session_store.append(sid, "assistant", cancelled_answer, ev)
+                    return
                 if t := c.content or "":
                     ans += t
                     yield sse.token(t)
+            session_store.append(sid, "assistant", ans, ev)
+            assistant_saved = True
+            yield sse.done(sid, ans, ev)
+        except asyncio.CancelledError:
+            if not assistant_saved:
+                session_store.append(sid, "assistant", _cancelled_answer(ans), ev)
+            raise
         except Exception as e:
             logger.error(f"stream fail: {e}")
-            yield sse.error(str(e))
             ans = f"生成失败: {e}"
-        sessions.setdefault(sid, []).append({"q": req.question, "a": ans, "ev": ev})
-        yield sse.done(ans, ev)
+            session_store.append(sid, "assistant", ans, ev)
+            yield sse.error(str(e))
+            yield sse.done(sid, ans, ev)
 
     return EventSourceResponse(gen())
 
 
+def _cancelled_answer(partial: str) -> str:
+    return f"{partial}\n\n已停止生成" if partial else "已停止生成"
+
+
 def _web_search(q: str) -> list[dict]:
     from tavily import TavilyClient
-    try:
-        r = TavilyClient(api_key=settings.tavily_api_key).search(query=q, search_depth="basic", max_results=3)
-    except Exception as e:
-        logger.warning(f"联网搜索失败（降级为本地检索）: {e}")
-        return []
-    return [{"id": f"web_{i}", "text": x.get("content", ""), "source": x.get("url", ""), "score": x.get("score", 0)} for i, x in enumerate(r.get("results", []))]
+    return search_web(q, TavilyClient(api_key=settings.tavily_api_key))
 
-async def _retrieve(q: str, use_web: bool = True, deep_mode: bool = False, history: str = "") -> list[dict]:
+async def _retrieve(q: str, use_web: bool = True, deep_mode: bool = False, history: str = "", kb_id: str = "", progress=None, cancelled=None, retry_retrieval: bool = False) -> list[dict]:
     import asyncio
     def _sync():
+        started = time.perf_counter()
+        ev = None
         if deep_mode:
-            from backend.src.agent.orchestrator import agent
+            from backend.src.agent.react_agent import run_react
             try:
-                return agent.invoke({"q": q, "routes": [], "idx": 0, "ev": [], "use_web": use_web}).get("ev", [])
+                ev = run_react(q, use_web=use_web, kb_id=kb_id, progress=progress, cancelled=cancelled)
             except Exception as e:
-                logger.warning(f"agent fail: {e}")
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        tasks, ev = {"vector": lambda: retriever.retrieve(q)}, []
-        if use_web and settings.tavily_api_key:
-            tasks["web"] = lambda: _web_search(q)
-        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-            for f in as_completed([pool.submit(t) for t in tasks.values()]):
-                try:
-                    ev.extend(f.result())
-                except Exception as e:
-                    logger.warning(f"retrieve fail: {e}")
+                logger.warning("ReAct agent fail (%s), falling back to vector retrieval", type(e).__name__)
+        if ev is None:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            tasks, ev = {"vector": lambda: retriever.retrieve(q, kb_id=kb_id)}, []
+            if use_web and settings.tavily_api_key:
+                tasks["web"] = lambda: _web_search(q)
+            with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+                for f in as_completed([pool.submit(track_tool, name, task, progress, cancelled) for name, task in tasks.items()]):
+                    try:
+                        ev.extend(f.result())
+                    except Exception as e:
+                        logger.warning(f"retrieve fail: {e}")
+        followup = retry_query(q, history, retry_retrieval and not deep_mode, (time.perf_counter() - started) * 1000, cancelled is not None and cancelled.is_set())
+        if followup:
+            try:
+                additional = track_tool("vector_retry", lambda: retriever.retrieve(followup, kb_id=kb_id), progress, cancelled)
+                if additional:
+                    ev = merge_evidence(ev, additional)
+            except Exception as e:
+                logger.warning("vector retry fail: %s", type(e).__name__)
         return ev
     return await asyncio.to_thread(_sync)
 
@@ -122,6 +175,7 @@ def _build_msg(q: str, ev: list[dict], history: str = "") -> list:
         '1. 严格依据参考资料回答，禁止使用自身知识。资料中没有则直接说"参考资料中未提及"\n'
         '2. 回答要简洁清晰，复杂信息用分点列出\n'
         '3. 不要编造信息，不确定就说"无法确定"'
+        '\n4. 使用证据时在对应陈述后标注 [1]、[2] 等编号，只能引用下面确实存在的参考资料编号；没有证据就不要引用'
     )
     user_q = q
     if history:
@@ -140,9 +194,9 @@ def _build_llm(streaming: bool = False):
     return llm
 
 
-def _generate(q: str, ev: list[dict]) -> str:
+def _generate(q: str, ev: list[dict], history: str = "") -> str:
     try:
-        return _build_llm().invoke(_build_msg(q, ev)).content
+        return _build_llm().invoke(_build_msg(q, ev, history)).content
     except Exception as e:
         return f"生成失败: {e}"
 
@@ -162,27 +216,61 @@ def list_kbs():
 
 @app.delete("/knowledge-bases/{kb_id}")
 def delete_kb(kb_id: str):
-    if not kb_service.delete(kb_id):
-        raise HTTPException(404, "知识库不存在")
-    return {"deleted": kb_id}
+    with knowledge_base_lock(kb_id):
+        if not kb_service.get(kb_id):
+            raise HTTPException(404, "知识库不存在")
+        warnings = _clear_graph_data(kb_id)
+        if warnings:
+            raise HTTPException(503, {"message": "知识库清理未完成，请重试", "warnings": warnings})
+        from backend.src.rag.store import vector_store
+        dd = kb_service.docs_dir(kb_id)
+        sources = [path.name for path in dd.iterdir() if path.is_file()] if dd.exists() else []
+        try:
+            for source in sources:
+                vector_store.delete_document(kb_id, source)
+            vector_store.delete_by_kb(kb_id)
+        except Exception as exc:
+            logger.error(f"删除知识库向量失败: {exc}")
+            raise HTTPException(503, "向量清理未完成，知识库未删除")
+        kb_service.delete(kb_id)
+        return {"deleted": kb_id}
 
 
 @app.post("/knowledge-bases/{kb_id}/upload")
 async def upload_kb(kb_id: str, files: list[UploadFile] = File(...)):
     if not kb_service.get(kb_id):
         raise HTTPException(404, "知识库不存在")
-    dd = kb_service.docs_dir(kb_id); dd.mkdir(parents=True, exist_ok=True)
-    saved, rejected = [], []
-    for f in files:
-        ext = Path(f.filename or "").suffix.lower()
-        if ext not in kb_service.SUPPORTED:
-            rejected.append({"filename": f.filename, "reason": f"不支持 {ext}"})
-            continue
-        dest = dd / f.filename
-        with open(dest, "wb") as out:
-            shutil.copyfileobj(f.file, out)
-        saved.append({"filename": f.filename, "size": dest.stat().st_size})
-    return {"saved": saved, "rejected": rejected}
+    return await asyncio.to_thread(_save_uploads, kb_id, files)
+
+
+def _save_uploads(kb_id: str, files: list[UploadFile]) -> dict:
+    with knowledge_base_lock(kb_id):
+        if not kb_service.get(kb_id):
+            raise HTTPException(404, "知识库不存在")
+        dd = kb_service.docs_dir(kb_id); dd.mkdir(parents=True, exist_ok=True)
+        saved, rejected = [], []
+        for f in files:
+            filename = f.filename or ""
+            ext = Path(filename).suffix.lower()
+            if ext not in kb_service.SUPPORTED:
+                rejected.append({"filename": filename, "reason": f"不支持 {ext or '无扩展名文件'}"})
+                continue
+            try:
+                dest = kb_service.safe_document_path(kb_id, filename)
+            except ValueError as exc:
+                rejected.append({"filename": filename, "reason": str(exc)})
+                continue
+            temp_dest = dest.with_name(f".{dest.name}.{uuid4().hex}.upload")
+            try:
+                with open(temp_dest, "wb") as out:
+                    shutil.copyfileobj(f.file, out)
+                temp_dest.replace(dest)
+            finally:
+                if temp_dest.exists():
+                    temp_dest.unlink()
+            saved.append({"filename": filename, "size": dest.stat().st_size})
+        warnings = _clear_graph_data(kb_id) if saved else []
+        return {"saved": saved, "rejected": rejected, "warnings": warnings}
 
 
 @app.get("/knowledge-bases/{kb_id}/documents")
@@ -191,12 +279,12 @@ def list_docs(kb_id: str):
         raise HTTPException(404, "知识库不存在")
     dd = kb_service.docs_dir(kb_id)
     docs = [{"filename": f.name, "size": f.stat().st_size, "suffix": f.suffix.lower()} for f in sorted(dd.iterdir()) if f.is_file()] if dd.exists() else []
-    # 查已索引的源文件
+    # 查已索引的源文件（按 kb_id 过滤）
     idxd: set[str] = set()
     try:
         from backend.src.rag.store import vector_store
         vector_store.load()
-        all_meta = vector_store._col.get(include=["metadatas"])
+        all_meta = vector_store._col.get(where={"kb_id": kb_id}, include=["metadatas"])
         if all_meta and all_meta["metadatas"]:
             idxd = set(m.get("source", "") for m in all_meta["metadatas"] if m.get("source"))
     except Exception:
@@ -208,13 +296,33 @@ def list_docs(kb_id: str):
 
 @app.delete("/knowledge-bases/{kb_id}/documents/{filename:path}")
 def delete_doc(kb_id: str, filename: str):
-    if not kb_service.get(kb_id):
-        raise HTTPException(404, "知识库不存在")
-    target = kb_service.docs_dir(kb_id) / filename
-    if not target.exists() or not target.is_file():
-        raise HTTPException(404, "文件不存在")
-    target.unlink()
-    return {"deleted": filename}
+    with knowledge_base_lock(kb_id):
+        if not kb_service.get(kb_id):
+            raise HTTPException(404, "知识库不存在")
+        try:
+            target = kb_service.safe_document_path(kb_id, filename)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if not target.exists() or not target.is_file():
+            raise HTTPException(404, "文件不存在")
+        tombstone = target.with_name(f".{target.name}.{uuid4().hex}.deleting")
+        target.replace(tombstone)
+        try:
+            from backend.src.rag.store import vector_store
+            vector_store.delete_document(kb_id, filename)
+        except Exception as exc:
+            tombstone.replace(target)
+            logger.error(f"删除文档向量失败: {exc}")
+            raise HTTPException(503, "向量清理失败，文档未删除")
+        try:
+            warnings = _clear_graph_data(kb_id)
+            tombstone.unlink()
+        except Exception as exc:
+            if tombstone.exists() and not target.exists():
+                tombstone.replace(target)
+            logger.error(f"删除文档派生数据失败: {exc}")
+            raise HTTPException(503, "派生数据清理失败，源文件已保留，请重新索引")
+        return {"deleted": filename, "warnings": warnings}
 
 
 @app.post("/knowledge-bases/{kb_id}/index")
@@ -225,12 +333,19 @@ async def index_kb_endpoint(kb_id: str):
     if not any(dd.iterdir()):
         raise HTTPException(400, "知识库中没有文档")
     try:
-        return index_kb(kb_id, str(dd))
+        return await asyncio.to_thread(_index_kb_locked, kb_id, str(dd))
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
         logger.error(f"索引失败: {e}")
         raise HTTPException(500, f"索引失败: {e}")
+
+
+def _index_kb_locked(kb_id: str, document_dir: str) -> dict:
+    with knowledge_base_lock(kb_id):
+        if not kb_service.get(kb_id):
+            raise ValueError("知识库不存在")
+        return index_kb(kb_id, document_dir)
 
 
 @app.get("/knowledge-bases/{kb_id}/graph")
@@ -242,14 +357,44 @@ def get_graph(kb_id: str):
 
 @app.delete("/knowledge-bases/{kb_id}/graph")
 def delete_graph(kb_id: str):
-    if not kb_service.get(kb_id):
-        raise HTTPException(404, "知识库不存在")
+    with knowledge_base_lock(kb_id):
+        if not kb_service.get(kb_id):
+            raise HTTPException(404, "知识库不存在")
+        warnings = _clear_graph_data(kb_id)
+        return {"deleted": not warnings, "warnings": warnings}
+
+
+def _clear_graph_data(kb_id: str) -> list[str]:
+    """Invalidate all derived graph data after source documents change."""
+
+    warnings: list[str] = []
     kb_service.save_graph(kb_id, {"nodes": [], "edges": []})
-    return {"deleted": True}
+    try:
+        from backend.src.rag.store import vector_store
+        vector_store.delete_entities(kb_id)
+    except Exception as exc:
+        logger.warning(f"删除知识库实体向量失败: {exc}")
+        warnings.append("实体向量清理未完成")
+    try:
+        from backend.src.services.graph_service import graph
+        graph.delete(kb_id)
+    except Exception as exc:
+        logger.warning(f"删除 Neo4j 图谱失败: {exc}")
+        warnings.append("Neo4j 图谱清理未完成")
+    return warnings
 
 
 @app.post("/knowledge-bases/{kb_id}/graph/build")
 async def build_graph(kb_id: str):
+    return await asyncio.to_thread(_build_graph_locked, kb_id)
+
+
+def _build_graph_locked(kb_id: str) -> dict:
+    with knowledge_base_lock(kb_id):
+        return _build_graph_sync(kb_id)
+
+
+def _build_graph_sync(kb_id: str):
     if not kb_service.get(kb_id):
         raise HTTPException(404, "知识库不存在")
     dd = kb_service.docs_dir(kb_id); dd.mkdir(parents=True, exist_ok=True)
@@ -307,34 +452,35 @@ async def build_graph(kb_id: str):
                     for k in ["subject", "object"]:
                         if r[k] not in sn:
                             sn.add(r[k]); all_nodes.append({"id": r[k], "group": abs(hash(r[k])) % 10 + 1})
-                    ek = (r["subject"], r["target"])
+                    ek = (r["subject"], r["object"])
                     if ek not in se:
                         se.add(ek); all_edges.append({"source": r["subject"], "target": r["object"], "label": r["relation"]})
             except Exception as e:
                 logger.warning(f"图片 {img_f.name} 抽取失败: {e}")
+        warnings: list[str] = []
         kb_service.save_graph(kb_id, {"nodes": all_nodes, "edges": all_edges})
-        try: graph.delete(kb_id); graph.save(kb_id, all_nodes, all_edges)
-        except Exception: logger.warning("Neo4j 不可用，跳过")
-        # 实体向量化
-        if all_nodes:
-            try:
+        try:
+            graph.delete(kb_id)
+            graph.save(kb_id, all_nodes, all_edges)
+        except Exception as exc:
+            logger.warning(f"Neo4j 图谱同步失败: {exc}")
+            warnings.append("Neo4j 图谱同步未完成")
+        try:
+            from backend.src.rag.store import vector_store
+            vector_store.delete_entities(kb_id)
+            if all_nodes:
                 from backend.src.rag.embedder import embedder
-                from backend.src.rag.store import vector_store
                 entity_texts = [n["id"] for n in all_nodes]
                 entity_dv = embedder.embed_dense(entity_texts)
                 vector_store.load()
-                # 删旧实体向量
-                exist = vector_store._col.get(where={"$and": [{"type": "entity"}, {"kb_id": kb_id}]})
-                if exist and exist["ids"]:
-                    vector_store._col.delete(ids=exist["ids"])
-                # 写新实体向量
                 eids = [f"ent_{kb_id}_{i}" for i in range(len(entity_texts))]
                 emeta = [{"source": n["id"], "type": "entity", "kb_id": kb_id} for n in all_nodes]
-                vector_store._col.add(ids=eids, embeddings=entity_dv.tolist(), documents=entity_texts, metadatas=emeta)
+                vector_store._col.upsert(ids=eids, embeddings=entity_dv.tolist(), documents=entity_texts, metadatas=emeta)
                 logger.info(f"实体向量化完成: {len(entity_texts)} 个")
-            except Exception as e:
-                logger.warning(f"实体向量化失败: {e}")
-        return {"chunks": len(chunks), "entities": len(all_nodes), "relations": len(all_edges)}
+        except Exception as exc:
+            logger.warning(f"实体向量化失败: {exc}")
+            warnings.append("实体向量同步未完成")
+        return {"chunks": len(chunks), "entities": len(all_nodes), "relations": len(all_edges), "warnings": warnings}
     except HTTPException:
         raise
     except Exception as e:

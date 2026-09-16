@@ -1,9 +1,12 @@
 import { reactive } from 'vue'
+import type { Message, ToolStep } from '../types/research'
 
 export interface ChatSession {
   id: string
+  serverId?: string
   title: string
-  messages: any[]
+  messages: Message[]
+  activeSteps?: ToolStep[]
   createdAt: number
 }
 
@@ -23,10 +26,11 @@ function curSession() { return sessions.find(s => s.id === curId) }
 export const chatState = reactive({
   sessions,
   curId,
-  get messages(): any[] { const c = curSession(); return c?.messages || [] },
+  get messages(): Message[] { const c = curSession(); return c?.messages || [] },
   setCurId(id: string) { curId = id; this.curId = id; localStorage.setItem('chat_cur_id', id) },
   newSession() {
-    const s: ChatSession = { id: Date.now().toString(36), title: '新对话', messages: [], createdAt: Date.now() }
+    const id = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`
+    const s: ChatSession = { id, serverId: id, title: '新对话', messages: [], createdAt: Date.now() }
     sessions.unshift(s)
     this.setCurId(s.id)
     saveSessions([...sessions])

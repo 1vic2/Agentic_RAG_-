@@ -2,10 +2,15 @@ import json
 
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
+from typing import Callable, NotRequired
+import threading
 
 from backend.src.config import settings
+from backend.src.agent.routing import next_step, sanitize_routes
 from backend.src.rag.retriever import retriever
 from backend.src.services.graph_service import graph as gs
+from backend.src.services.tool_progress import track_tool
+from backend.src.services.web_search import search_web
 from backend.src.utils.helpers import get_llm, get_logger
 
 logger = get_logger(__name__)
@@ -25,16 +30,18 @@ class State(TypedDict):
     idx: int
     ev: list[dict]
     use_web: bool
+    kb_id: str
+    progress: NotRequired[Callable[[dict], None]]
+    cancelled: NotRequired[threading.Event]
 
 
 def route(state: State) -> dict:
     av = {k:v for k,v in _TOOLS.items() if k != 'web' or state.get('use_web', True)}
     if not av: av = {'vector': _TOOLS['vector']}
-    tl = ', '.join(av.keys())
     r = llm.invoke(f"判断问题需要哪些检索工具。\n可选工具: {', '.join(f'{k}({v})' for k,v in av.items())}\n规则:\n- 信息求证类 → vector\n- 实体关系类 → graph\n- 实时/外网信息 → web\n- 多需求可返回多个\n- 只输出 JSON 数组，如 [\"vector\", \"web\"]\n问题: {state['q']}")
     try:
-        rt = json.loads(r.content.strip().removeprefix("```json").removesuffix("```").strip())
-        rt = [t for t in rt if t in _TOOLS] or ["vector"]
+        raw = json.loads(r.content.strip().removeprefix("```json").removesuffix("```").strip())
+        rt = sanitize_routes(raw, av.keys())
     except Exception:
         rt = ["vector"]
     logger.info(f"Agent routes: {rt}")
@@ -44,25 +51,26 @@ def route(state: State) -> dict:
 def run(state: State) -> dict:
     idx = state["idx"]
     t = state["routes"][idx]
+    kb_id = state.get("kb_id", "")
     logger.info(f"Executing: {t} ({idx+1}/{len(state['routes'])})")
     ev = []
+    progress = state.get("progress")
+    cancelled = state.get("cancelled")
+    if cancelled is not None and cancelled.is_set():
+        return {"ev": state["ev"], "idx": idx + 1}
     try:
         if t == "vector":
-            ev = retriever.retrieve(state["q"])
+            ev = track_tool(t, lambda: retriever.retrieve(state["q"], kb_id=kb_id), progress, cancelled)
         elif t == "graph":
-            try: gs._connect()
-            except: logger.warning("Neo4j 不可用"); return {"ev": state["ev"], "idx": idx + 1}
-            ev = gs.search(state["q"])
+            def graph_query():
+                gs._connect()
+                return gs.search(state["q"], kb_id=kb_id)
+            ev = track_tool(t, graph_query, progress, cancelled)
         elif t == "web":
-            from tavily import TavilyClient
-            r = TavilyClient(api_key=settings.tavily_api_key).search(query=state["q"], search_depth="basic", max_results=3)
-            ev = [
-                {"id": f"web_{i}", 
-                "text": x.get("content", ""), 
-                "source": x.get("url", ""), 
-                "score": x.get("score", 0)
-                } 
-                for i, x in enumerate(r.get("results", []))]
+            def web_query():
+                from tavily import TavilyClient
+                return search_web(state["q"], TavilyClient(api_key=settings.tavily_api_key))
+            ev = track_tool(t, web_query, progress, cancelled)
         return {"ev": state["ev"] + ev, "idx": idx + 1}
     except Exception as e:
         logger.warning(f"{t} fail: {e}")
@@ -70,7 +78,10 @@ def run(state: State) -> dict:
 
 
 def next(state: State) -> str:
-    return "run" if state["idx"] + 1 < len(state["routes"]) else "end"
+    cancelled = state.get("cancelled")
+    if cancelled is not None and cancelled.is_set():
+        return "end"
+    return next_step(state["idx"], state["routes"])
 
 
 def build():

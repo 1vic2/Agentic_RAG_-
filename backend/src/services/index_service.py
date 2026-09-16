@@ -18,7 +18,7 @@ def index_kb(kb_id: str, dd: str) -> dict:
     sources = [c.metadata.get("source", "unknown") for c in chunks]
     dv = embedder.embed_dense(texts)
     vector_store.load()
-    vector_store.insert(texts, sources, dv)
+    vector_store.replace_documents(texts, sources, dv, kb_id=kb_id)
     # 检查被跳过的文件
     indexed_sources = set(sources)
     all_files = [f for f in Path(dd).iterdir() if f.is_file()]
